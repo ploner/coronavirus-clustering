@@ -1,0 +1,448 @@
+---
+jupyter:
+  jupytext:
+    formats: ipynb,Rmd
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.4.1
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{html}
+<style>
+g.pointtext {
+    display: none;
+}
+```
+
+```{python}
+# !pip install country_converter --upgrade
+```
+
+```{python}
+import pandas as pd
+import re
+from datetime import datetime
+from os.path import isfile
+import numpy as np
+import country_converter as coco
+import world_bank_data as wb
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import seaborn as sns    
+import umap.umap_ as umap   ## !pip install 'umap-learn==0.3.10'
+import hdbscan
+
+sns.set(style="whitegrid")
+
+DEFAULT_PLOTLY_COLORS=['rgb(31, 119, 180)', 'rgb(255, 127, 14)',
+                       'rgb(44, 160, 44)', 'rgb(214, 39, 40)',
+                       'rgb(148, 103, 189)', 'rgb(140, 86, 75)',
+                       'rgb(227, 119, 194)', 'rgb(127, 127, 127)',
+                       'rgb(188, 189, 34)', 'rgb(23, 190, 207)']
+```
+
+```{python}
+baseURL = "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+fileNamePickle = "allData.pkl"
+```
+
+```{python}
+def read_demographic_data_of_chinese_provinces():
+    ## Text file saved from https://en.wikipedia.org/wiki/Provinces_of_China. 
+    file = open('china_population_wiki.tsv', 'r') 
+    lines = []
+    for i, text in enumerate(file.readlines()):
+        if i % 3 == 0:
+            line = ''
+        line += text.strip()
+        if i % 3 == 2:
+            lines = lines + [line.split('\t')]
+    df = pd.DataFrame.from_records(lines).iloc[:, [1, 2, 4, 5, 6, 7]]
+    df.columns = ['ISO', 'Province_Orig', 'Capital', 'Population', 'Density', 'Area']
+    df.Population = [int(re.sub(',|\[8\]', '', p)) for p in df.Population]
+    df['Province'] = [ \
+        re.sub("Province.*|Municipality.*|Autonomous.*|Zhuang.*|Special.*|Hui|Uyghur", "", s).strip() \
+        for s in df['Province_Orig']]
+    return df.sort_values('Province')
+
+def add_global_population(data):
+    d = data.copy()
+    ## Global Population from World Bank.
+    pop_GLO = wb.get_series('SP.POP.TOTL', date='2018', id_or_value='id', simplify_index=True)
+    countries = d['Country'].unique()
+    IOS3_codes = coco.convert(list(countries), to='ISO3')
+    ISO3_map = dict(zip(countries, IOS3_codes))
+    d.insert(4, 'Population', \
+        [pop_GLO[c] if c in pop_GLO else 0 for c in [ISO3_map[country] for country in d.Country]]
+    )
+    ## Chinese provinces from Wiki.
+    pop_CHI = read_demographic_data_of_chinese_provinces().set_index('Province')['Population']
+    ind = (d.Country == 'China') & (d.State != '<all>')
+    d.loc[ind, 'Population'] = [pop_CHI[p] if p in pop_CHI else 0 for p in d.loc[ind, 'State']]
+    return d
+
+def loadData_GLOB(fileName, columnName): 
+    agg_dict = { columnName:sum, 'Lat':np.median, 'Long':np.median }
+    data = pd.read_csv(baseURL + fileName) \
+             .rename(columns={ 'Country/Region':'Country', 'Province/State':'State' }) \
+             .melt(id_vars=['Country', 'State', 'Lat', 'Long'], var_name='date', value_name=columnName) \
+             .astype({'date':'datetime64[ns]', columnName:'Int64'}, errors='ignore')
+    ## Extract chinese provinces separately.
+    data_CHI = data[data.Country == 'China']
+    data = data.groupby(['Country', 'date']).agg(agg_dict).reset_index()
+    data.loc[data.Country == 'Denmark', 'Lat'] = 56.2639
+    data.loc[data.Country == 'Denmark', 'Long'] = 9.5018
+    data.loc[data.Country == 'France', 'Lat'] = 46.2276
+    data.loc[data.Country == 'France', 'Long'] = 2.2137
+    data.loc[data.Country == 'Netherlands', 'Lat'] = 52.1326
+    data.loc[data.Country == 'Netherlands', 'Long'] = 5.2913
+    data.loc[data.Country == 'United Kingdom', 'Lat'] = 55.3781
+    data.loc[data.Country == 'United Kingdom', 'Long'] = -3.4360
+    data['State'] = '<all>'
+    return pd.concat([data, data_CHI])
+
+## JHU data includes the population within the deaths file, only.
+def loadData_US(fileName, columnName, addPopulation=False): 
+    id_vars=['Country', 'State', 'Lat', 'Long']
+    agg_dict = { columnName:sum, 'Lat':np.median, 'Long':np.median }
+    if addPopulation:
+        id_vars.append('Population')
+        agg_dict['Population'] = sum 
+    data = pd.read_csv(baseURL + fileName).iloc[:, 6:] \
+             .drop('Combined_Key', axis=1) \
+             .rename(columns={ 'Country_Region':'Country', 'Province_State':'State', 'Long_':'Long' }) \
+             .melt(id_vars=id_vars, var_name='date', value_name=columnName) \
+             .astype({'date':'datetime64[ns]', columnName:'Int64'}, errors='ignore') \
+             .groupby(['Country', 'State', 'date']).agg(agg_dict).reset_index()
+    return data
+
+def refreshData():
+    data_GLOB = loadData_GLOB("time_series_covid19_confirmed_global.csv", "CumConfirmed") \
+        .merge(loadData_GLOB("time_series_covid19_deaths_global.csv", "CumDeaths"))
+    data_GLOB = add_global_population(data_GLOB)
+    data_US = loadData_US("time_series_covid19_confirmed_US.csv", "CumConfirmed") \
+        .merge(loadData_US("time_series_covid19_deaths_US.csv", "CumDeaths", addPopulation=True))
+    data = pd.concat([data_GLOB, data_US])
+    data.to_pickle(fileNamePickle)
+    return data
+
+def allData():
+    if not isfile(fileNamePickle):
+        refreshData()
+    allData = pd.read_pickle(fileNamePickle)
+    return allData
+```
+
+```{python}
+def geometric_mean(values):
+    return np.exp(np.mean(np.log(values)))
+
+def geometric_simple_moving_average(df, len=7):
+    return df.apply(np.log).rolling(len).mean().apply(np.exp)
+```
+
+```{python}
+def fix_zeros(df_column):
+    ind = np.where(df_column[1:] == 0.0)[0] + 1  # Ignore first value (<NA>).
+    for i in ind[ind < df_column.size - 1]:
+        df_column.iloc[i] = df_column.iloc[i+1] = 0.5 * df_column.iloc[i+1]
+    return df_column
+
+def prepare_data(df):
+    df_cum_cases = df.select_dtypes(include='Int64').astype('float')
+    df_new_cases = df_cum_cases.diff()  # 1st row is <NA>. 
+    df_new_cases = df_new_cases.apply(fix_zeros)
+    df_cum_cases = df_new_cases.cumsum()
+    df_new_cases.columns = [column.replace('Cum', 'New') for column in df_new_cases.columns]
+    df_all = df_cum_cases.join(df_new_cases)
+    df_GMA7 = geometric_simple_moving_average(df_all, len=7)
+    return df_cum_cases, df_new_cases, df_all, df_GMA7
+
+def get_conditional_date(ind, df):
+    if len(ind) == 0:
+        ind = np.nan
+        date = np.nan
+        days_since = np.nan
+    else:
+        ind = ind[0]
+        date = df.iloc[ind]['date']
+        days_since = (datetime.now() - date).days
+    return ind, date, days_since
+```
+
+```{python}
+def get_features(df):
+    if df.size < 29+7:
+        return { }
+    ## Remove last row if it seems broken (confirmed cases dropped by >80%).
+    if df.iloc[-1]['CumConfirmed'] < 0.20 * df.iloc[-2]['CumConfirmed']:
+        df = df[:-1]
+    last = df.iloc[-1]
+    df_cum_cases, df_new_cases, df_all, df_GMA7 = prepare_data(df)
+    ## Index of Outbreak Date (cases > 100/20M).
+    ind_outbreak, date_outbreak, days_since_outbreak = get_conditional_date(np.where(df_cum_cases.CumConfirmed / df.Population > 5 / 1E6)[0], df)
+    ## Index of Outbreak Date (cases > 1000/20M).
+    ind_10X, date_10X, _ = get_conditional_date(np.where(df_cum_cases.CumConfirmed / df.Population > 50 / 1E6)[0], df)
+    ## Index of Peak week.
+    ind_peak = np.argmax(df_GMA7.NewDeaths)
+    date_peak = df.iloc[ind_peak]['date']
+    ## Early Motality.
+    earlyMortality = df_GMA7.NewDeaths.iloc[ind_outbreak + 17] / df_GMA7.NewConfirmed.iloc[ind_outbreak + 3] \
+        if (df_GMA7.shape[0] > ind_outbreak + 17) else np.nan
+    earlyAcceleration = \
+        (df_GMA7.NewConfirmed.iloc[ind_outbreak + 17] / df_GMA7.NewConfirmed.iloc[ind_outbreak] + 10) / \
+        (df_GMA7.NewConfirmed.iloc[ind_outbreak + 10] / df_GMA7.NewConfirmed.iloc[ind_outbreak] + 3) \
+        if (df_GMA7.shape[0] > ind_outbreak + 17) else np.nan
+    newConf_W0toW2 = df_GMA7.NewConfirmed.iloc[-1] / df_GMA7.NewConfirmed.iloc[-15]
+    newConf_W2toW4 = df_GMA7.NewConfirmed.iloc[-15] / df_GMA7.NewConfirmed.iloc[-29]
+    return {
+        'Population':last.Population,
+        'OutbreakDate':date_outbreak,
+        'DaysSinceOutbreak':days_since_outbreak, 
+        'DaysSincePeak':(datetime.now() - date_peak).days,
+        'DaysTo10X':ind_10X - ind_outbreak,
+        'CasesPerMillion':last.CumConfirmed / last.Population * 1E6,
+        'DeathsPerMillion':last.CumDeaths / last.Population * 1E6,
+        'PeakMortality':df_GMA7.NewDeaths.iloc[ind_peak] / df_GMA7.NewConfirmed.iloc[ind_peak - 14],
+        'EarlyMortality':earlyMortality,
+        'EarlyAccel':earlyAcceleration,
+        'NewConf_W0toW2':newConf_W0toW2,
+        'NewConf_W2toW4':newConf_W2toW4,
+        'CurrentAccel':newConf_W0toW2 / newConf_W2toW4
+    }
+```
+
+## Import
+
+```{python}
+## Load COVID-19 data from JHU.
+data = allData()[['Country', 'State', 'date', 'Lat', 'Long', 'Population', 'CumConfirmed', 'CumDeaths']]
+#data = data[data['Country'].isin(['Italy', 'France', 'Turkey', 'Netherlands', 'Germany', 'Austria'])]
+
+## Collect countries for UI elements.
+countries = data['Country'].unique()
+countries.sort()
+```
+
+```{python}
+data[(data.date == '2020-04-11') & (data.Population > 1E6)].sample(15)
+```
+
+## Generate Features
+
+```{python}
+## Calculate features.
+features = data.groupby(['Country', 'State']).apply(get_features)
+features = pd.DataFrame(list(features), index=features.index)
+```
+
+Add region (country+state):
+
+```{python}
+features['Region'] = features.index.get_level_values('Country')
+is_region = (features.index.get_level_values('State') != '<all>')
+features.loc[is_region, 'Region'] = features.index.get_level_values('Country')[is_region] + ':' + \
+    features.index.get_level_values('State')[is_region]
+```
+
+```{python}
+features[features.index.get_level_values('Country') == 'US'].sort_values("DeathsPerMillion", ascending=False).head(30)
+```
+
+#### Create Bar Chart: Death per Million
+
+```{python}
+d = features[features.Population >= 1E6].sort_values('DeathsPerMillion', ascending=False).head(25)
+colors = ['crimson' if s=='<all>' else 'lightgrey' for s in d.index.get_level_values('State')]
+go.Figure([go.Bar(
+    x=d.Region, y=d.DeathsPerMillion,
+    text=round(d.DeathsPerMillion),
+    marker_color=colors,
+    textposition='auto',
+)]).update_layout(
+    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+    width=1000, height=700,
+    font=dict(family="Courier New, monospace", size=22),
+    title_text='Deaths per Million Population'
+).show(displayModeBar=False)
+```
+
+```{python}
+## Lombardia
+10621 / 10.06
+```
+
+## Plot Subset of Data
+
+```{python}
+xlim = 45
+data_plot = features.merge(data, how='left').sort_values(['Region', 'date'])
+data_plot['days'] = (data_plot.date - data_plot.OutbreakDate).dt.days
+data_plot = data_plot[(data_plot.days >= 0) & (data_plot.days <= xlim)]
+data_plot.sample(3)
+```
+
+```{python}
+def create_plot(data, lwd_country=2, lwd_state=2, showlegend=False):
+    fig = go.Figure()
+    sorted_regions = data.groupby('Region').last().sort_values('CasesPerMillion').index
+    for region in sorted_regions:
+        if (region == 'Germany') | (region == 'US:New York'):
+            textpos = 'bottom center'
+        elif region == 'Netherlands':
+            textpos = 'top center'
+        else:
+            textpos = "top center"
+        d = data[(data.Region == region)]
+        n = (d.shape[0] - 1)
+        line_width = lwd_country if d.iloc[0]['State'] == '<all>' else lwd_state
+        fig.add_trace(go.Scatter(
+            x=d.days, y=d.CumConfirmed / d.Population * 1E6, 
+            mode='lines+text+markers', name=region, 
+            marker={ 'size': [0] * n + [6] },
+            line={ 'width':line_width },
+            text=[""] * n + [region], textposition=textpos, textfont_size=13
+        ))
+    fig.update_layout(
+        legend={ 'traceorder':'reversed', 'font':{ 'size':13 } },
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(family="Courier New, monospace", size=18),
+        width=1000, height=750,
+        showlegend=showlegend,
+        title='Cumulated Number of COVID-19 Cases since Outbreak',
+        xaxis_title='Days since Outbreak (= more than 5 cases per million)', yaxis_type="log",
+        yaxis_title='Cumulated Confirmed Cases per Million') \
+   .update_xaxes(showline=True, linewidth=2, gridcolor='lightgrey', range=[0, xlim*1.1]) \
+   .update_yaxes(showline=True, linewidth=2, gridcolor='lightgrey') \
+   .show(displayModeBar=False)
+```
+
+```{html}
+<style>
+g.pointtext {
+    display: none;
+    traceorder: reversed;
+}
+```
+
+```{python}
+create_plot(data_plot[
+    (data_plot.Population > 15E6) & (data_plot.CasesPerMillion > 50) & (data_plot.State == '<all>')
+], showlegend=True)
+```
+
+```{python}
+create_plot(data_plot[
+    (data_plot.Country =='US') & (data_plot.State != '<all>') &
+    (data_plot.Population > 5.0E6) ##& (data_plot.CasesPerMillion > 50)
+], showlegend=True)
+```
+
+# Cluster Analysis
+
+```{python}
+features.head()
+```
+
+### Functions
+
+```{python}
+def get_features(features, names=['DaysTo10X', 'EarlyMortality', 'EarlyAccel']):
+    d = features[names + ['Region']].set_index('Region')
+    d = d.replace([np.inf, -np.inf], np.nan)
+    d = d.dropna()
+    return d
+
+## Read https://umap-learn.readthedocs.io/en/latest/clustering.html
+def plot_umap_with_clusters(d, random_state=7):
+    standard_embedding = umap.UMAP(random_state=random_state
+    ).fit_transform(d)
+    
+    clusterable_embedding = umap.UMAP(random_state=random_state, min_dist=0.0, n_neighbors=10,
+    ).fit_transform(d)
+    
+    labels = hdbscan.HDBSCAN(min_samples=2, min_cluster_size=5,
+    ).fit_predict(clusterable_embedding)
+    
+    clustered = (labels >= 0)
+    print(np.unique(labels, return_counts=True))
+    
+    go.Figure() \
+    .add_trace(go.Scatter(
+        x=standard_embedding[:,0], y=standard_embedding[:,1],
+        mode='text+markers', text=[r for r in d.index], 
+        marker={ 'color':[DEFAULT_PLOTLY_COLORS[c] for c in labels[clustered]] },
+        textposition="top center",
+    )) \
+    .update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(family="Courier New, monospace", size=15),
+        width=1000, height=750,
+        title='UMAP projection of the COVID-19 Outbreak Data',
+        xaxis_title='', yaxis_title='') \
+    .update_xaxes(showline=True, linewidth=2, gridcolor='lightgrey') \
+    .update_yaxes(showline=True, linewidth=2, gridcolor='lightgrey') \
+    .show(displayModeBar=False) 
+    return labels
+        
+def make_violin_plots(d, labels, rows=1):
+    fig = make_subplots(rows=rows, cols=3, subplot_titles=d.columns)
+    for i, name in enumerate(d.columns):
+        for label in np.unique(labels):
+            ind = (labels == label)
+            fig.add_trace(
+                go.Violin(
+                    y=d.loc[ind, name], box_visible=True, line_color=DEFAULT_PLOTLY_COLORS[label], 
+                    name="Class " + str(label)
+                ), row=int(i/3) + 1, col=(i % 3) + 1
+            )
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+        font=dict(family="Courier New, monospace", size=15),
+        width=1200, height=1000, showlegend=False) \
+    .update_yaxes(showline=False, linewidth=0) \
+    .show()
+```
+
+```{python}
+np.mean([25, 50, 100, 200, 400])
+```
+
+## Clustering of Outbreak Data
+
+
+### UMAP Projection with HDFSCAN Clustering
+
+```{python}
+f.tail(30)
+```
+
+```{python}
+f = get_features(features, names=['DaysTo10X', 'EarlyMortality', 'EarlyAccel'])
+labels = plot_umap_with_clusters(f, random_state=11)
+```
+
+```{python}
+make_violin_plots(f, labels)
+```
+
+## Clustering of Overall Data
+
+
+### UMAP Projection with HDFSCAN Clustering
+
+```{python}
+f = get_features(features, names=['DaysTo10X', 'EarlyMortality', 'PeakMortality', 'EarlyAccel', 'CurrentAccel'])
+labels = plot_umap_with_clusters(f, random_state=14)
+```
+
+```{python}
+make_violin_plots(f, labels, rows=2)
+```
